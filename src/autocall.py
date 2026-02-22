@@ -24,6 +24,7 @@ from .utils import simulate_gbm_paths, simulate_gbm_paths_antithetic, simulate_p
 
 if TYPE_CHECKING:
     from .local_vol import VolModel
+    from .heston import HestonModel
 
 
 class Autocallable:
@@ -127,7 +128,14 @@ class Autocallable:
         n_steps = self.n_observations * n_steps_per_period
         obs_indices = [i * n_steps_per_period for i in range(1, self.n_observations + 1)]
 
-        if self.vol_model is not None:
+        # Check for HestonModel (stochastic vol — paths generated internally)
+        from .heston import HestonModel
+        if isinstance(self.vol_model, HestonModel):
+            paths = self.vol_model.simulate_paths(
+                S0=self.S0, r=self.r, T=self.T,
+                n_steps=n_steps, n_paths=n_paths, seed=seed,
+            )
+        elif self.vol_model is not None:
             # Local vol / term structure: Euler-Maruyama simulation
             # Antithetic variates not applicable (path-dependent vol)
             paths = simulate_paths_local_vol(
