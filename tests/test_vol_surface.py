@@ -182,3 +182,67 @@ class TestImpliedVolSurface:
             v_orig = mock_surface.atm_vol(T)
             v_shift = shifted.atm_vol(T)
             assert abs(v_shift - v_orig - delta) < 0.005
+
+
+class TestFitQuality:
+    @pytest.fixture
+    def mock_surface(self):
+        """Build a surface from synthetic SVI params."""
+        calibrations = {
+            0.5: {"params": (0.02, 0.10, -0.3, 0.0, 0.1), "rmse": 0.001, "success": True, "n_points": 10},
+            1.0: {"params": (0.04, 0.08, -0.4, 0.0, 0.15), "rmse": 0.002, "success": True, "n_points": 10},
+            2.0: {"params": (0.08, 0.06, -0.5, 0.0, 0.2), "rmse": 0.003, "success": True, "n_points": 10},
+        }
+        return ImpliedVolSurface(spot=100, r=0.03, svi_calibrations=calibrations)
+
+    def test_fit_quality_returns_dict(self, mock_surface):
+        result = mock_surface.fit_quality()
+        assert isinstance(result, dict)
+
+    def test_fit_quality_has_expected_keys(self, mock_surface):
+        result = mock_surface.fit_quality()
+        assert "overall_rmse" in result
+        assert "per_slice_rmse" in result
+        assert "per_slice_max_error" in result
+        assert "n_slices" in result
+
+    def test_fit_quality_n_slices(self, mock_surface):
+        result = mock_surface.fit_quality()
+        assert result["n_slices"] == 3
+
+    def test_fit_quality_rmse_non_negative(self, mock_surface):
+        result = mock_surface.fit_quality()
+        assert result["overall_rmse"] >= 0
+        for T, rmse in result["per_slice_rmse"].items():
+            assert rmse >= 0
+
+
+class TestArbitrageCheck:
+    @pytest.fixture
+    def mock_surface(self):
+        """Build surface that should pass basic arbitrage checks."""
+        calibrations = {
+            0.5: {"params": (0.02, 0.10, -0.3, 0.0, 0.1), "rmse": 0.001, "success": True, "n_points": 10},
+            1.0: {"params": (0.04, 0.08, -0.4, 0.0, 0.15), "rmse": 0.001, "success": True, "n_points": 10},
+            2.0: {"params": (0.08, 0.06, -0.5, 0.0, 0.2), "rmse": 0.001, "success": True, "n_points": 10},
+        }
+        return ImpliedVolSurface(spot=100, r=0.03, svi_calibrations=calibrations)
+
+    def test_arbitrage_check_returns_dict(self, mock_surface):
+        result = mock_surface.arbitrage_check()
+        assert isinstance(result, dict)
+
+    def test_arbitrage_check_has_expected_keys(self, mock_surface):
+        result = mock_surface.arbitrage_check()
+        assert "butterfly_pass" in result
+        assert "calendar_spread_pass" in result
+
+    def test_butterfly_check_structure(self, mock_surface):
+        result = mock_surface.arbitrage_check()
+        assert isinstance(result["butterfly_pass"], bool)
+        assert "butterfly_details" in result
+
+    def test_calendar_spread_check_structure(self, mock_surface):
+        result = mock_surface.arbitrage_check()
+        assert isinstance(result["calendar_spread_pass"], bool)
+        assert "calendar_details" in result

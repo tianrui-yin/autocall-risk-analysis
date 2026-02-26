@@ -520,6 +520,109 @@ class ImpliedVolSurface:
 
         return M_grid, T_grid, vol_grid
 
+    def fit_quality(self) -> dict:
+        """
+        Report calibration quality metrics for the SVI surface.
+
+        Returns
+        -------
+        dict with keys:
+            'per_slice_rmse': dict mapping T -> RMSE (vol space)
+            'per_slice_max_error': dict mapping T -> max absolute error (vol space)
+            'overall_rmse': float — pooled RMSE across all slices
+            'n_slices': int
+        """
+        per_slice_rmse = {}
+        per_slice_max_error = {}
+
+        for T_val, cal in self._calibrations.items():
+            per_slice_rmse[T_val] = cal.get("rmse", 0.0)
+            # Max error: approximate from RMSE if not separately stored
+            per_slice_max_error[T_val] = cal.get("max_error", cal.get("rmse", 0.0))
+
+        rmse_values = list(per_slice_rmse.values())
+        overall_rmse = float(np.sqrt(np.mean(np.array(rmse_values) ** 2))) if rmse_values else 0.0
+
+        return {
+            "per_slice_rmse": per_slice_rmse,
+            "per_slice_max_error": per_slice_max_error,
+            "overall_rmse": overall_rmse,
+            "n_slices": len(self._calibrations),
+        }
+
+    def arbitrage_check(
+        self,
+        k_grid: Optional[np.ndarray] = None,
+    ) -> dict:
+        """
+        Check the SVI surface for butterfly and calendar spread arbitrage.
+
+        Butterfly: d^2 w / dk^2 >= 0 (convexity of total variance).
+        Calendar: w(k, T1) <= w(k, T2) for T1 < T2.
+
+        Parameters
+        ----------
+        k_grid : np.ndarray, optional
+            Log-moneyness grid for checks. Default: [-0.3, 0.3] with 100 points.
+
+        Returns
+        -------
+        dict with keys:
+            'butterfly_pass': bool
+            'butterfly_details': list of violations
+            'calendar_spread_pass': bool
+            'calendar_details': list of violations
+        """
+        if k_grid is None:
+            k_grid = np.linspace(-0.3, 0.3, 100)
+
+        # ----- Butterfly arbitrage: d^2w/dk^2 >= 0 -----
+        butterfly_violations = []
+        for T_val in self._maturities:
+            params = self._calibrations[T_val]["params"]
+            for k in k_grid:
+                d2w = svi_d2w_dk2(k, params)
+                if d2w < -1e-10:
+                    butterfly_violations.append({
+                        "T": float(T_val),
+                        "k": float(k),
+                        "d2w_dk2": float(d2w),
+                    })
+
+        butterfly_pass = len(butterfly_violations) == 0
+
+        # ----- Calendar spread arbitrage: w(k, T1) <= w(k, T2) -----
+        calendar_violations = []
+        # Check at ATM (k=0) and +/- 10% moneyness
+        check_points = [0.0, -0.1, 0.1]
+
+        sorted_Ts = sorted(self._maturities)
+        for i in range(len(sorted_Ts) - 1):
+            T1, T2 = sorted_Ts[i], sorted_Ts[i + 1]
+            params1 = self._calibrations[T1]["params"]
+            params2 = self._calibrations[T2]["params"]
+
+            for k in check_points:
+                w1 = svi_total_variance(np.array([k]), params1)[0]
+                w2 = svi_total_variance(np.array([k]), params2)[0]
+                if w1 > w2 + 1e-10:
+                    calendar_violations.append({
+                        "T1": float(T1),
+                        "T2": float(T2),
+                        "k": float(k),
+                        "w_T1": float(w1),
+                        "w_T2": float(w2),
+                    })
+
+        calendar_pass = len(calendar_violations) == 0
+
+        return {
+            "butterfly_pass": butterfly_pass,
+            "butterfly_details": butterfly_violations,
+            "calendar_spread_pass": calendar_pass,
+            "calendar_details": calendar_violations,
+        }
+
     def shift(self, delta_sigma: float) -> "ImpliedVolSurface":
         """
         Create a parallel-shifted surface (for Vega computation).
