@@ -91,18 +91,86 @@ def rho(
     return (V_up - V_down) / (2 * bump_abs)
 
 
+def vanna(
+    product: Autocallable,
+    bump_pct_spot: float = 0.01,
+    bump_pct_vol: float = 0.01,
+    n_paths: int = 200_000,
+    seed: int = 42,
+) -> float:
+    """
+    Vanna = d²V / (dS * dσ) via cross finite difference.
+
+    Measures sensitivity of delta to volatility changes (or equivalently,
+    sensitivity of vega to spot changes). Critical for hedging autocallables
+    near barriers where delta-vol interaction is significant.
+
+    Vanna = [V(S+dS,σ+dσ) - V(S+dS,σ-dσ) - V(S-dS,σ+dσ) + V(S-dS,σ-dσ)] / (4*dS*dσ)
+    """
+    dS = product.S0 * bump_pct_spot
+    d_sigma = bump_pct_vol  # absolute vol bump (e.g., 0.01 = 100bps)
+
+    V_pp = product.price_for_greeks(
+        S0=product.S0 + dS, sigma=product.sigma + d_sigma,
+        n_paths=n_paths, seed=seed,
+    )
+    V_pm = product.price_for_greeks(
+        S0=product.S0 + dS, sigma=product.sigma - d_sigma,
+        n_paths=n_paths, seed=seed,
+    )
+    V_mp = product.price_for_greeks(
+        S0=product.S0 - dS, sigma=product.sigma + d_sigma,
+        n_paths=n_paths, seed=seed,
+    )
+    V_mm = product.price_for_greeks(
+        S0=product.S0 - dS, sigma=product.sigma - d_sigma,
+        n_paths=n_paths, seed=seed,
+    )
+
+    return (V_pp - V_pm - V_mp + V_mm) / (4 * dS * d_sigma)
+
+
+def volga(
+    product: Autocallable,
+    bump_pct: float = 0.01,
+    n_paths: int = 200_000,
+    seed: int = 42,
+) -> float:
+    """
+    Volga = d²V / dσ² via central finite difference.
+
+    Measures convexity of price with respect to volatility.
+    Positive volga indicates long vol convexity (benefits from vol-of-vol).
+
+    Volga = [V(σ+dσ) - 2*V(σ) + V(σ-dσ)] / dσ²
+    """
+    d_sigma = bump_pct
+
+    V_up = product.price_for_greeks(
+        sigma=product.sigma + d_sigma, n_paths=n_paths, seed=seed,
+    )
+    V_base = product.price_for_greeks(n_paths=n_paths, seed=seed)
+    V_down = product.price_for_greeks(
+        sigma=product.sigma - d_sigma, n_paths=n_paths, seed=seed,
+    )
+
+    return (V_up - 2 * V_base + V_down) / (d_sigma ** 2)
+
+
 def compute_all_greeks(
     product: Autocallable,
     n_paths: int = 200_000,
     seed: int = 42,
 ) -> dict:
-    """Compute all Greeks for the autocallable."""
+    """Compute all Greeks for the autocallable, including higher-order cross-Greeks."""
     return {
         "delta": delta(product, n_paths=n_paths, seed=seed),
         "gamma": gamma(product, n_paths=n_paths, seed=seed),
         "vega": vega(product, n_paths=n_paths, seed=seed),
         "theta": theta(product, n_paths=n_paths, seed=seed),
         "rho": rho(product, n_paths=n_paths, seed=seed),
+        "vanna": vanna(product, n_paths=n_paths, seed=seed),
+        "volga": volga(product, n_paths=n_paths, seed=seed),
     }
 
 
