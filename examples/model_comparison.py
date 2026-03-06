@@ -1,12 +1,13 @@
 """
-Model Comparison: Constant Vol vs Term Structure vs Local Vol
+Model Comparison: Constant Vol vs Term Structure vs Local Vol vs Heston
 
-Prices the same Phoenix Autocallable under three volatility models to
+Prices the same Phoenix Autocallable under four volatility models to
 quantify model risk for barrier products.
 
 Key insight: constant vol underestimates knock-in probability because it
 ignores the vol smile (in reality, vol rises as spot drops — the "leverage
-effect"). Local vol captures this, giving a more realistic risk picture.
+effect"). Local vol and Heston capture this through different mechanisms,
+giving a more realistic risk picture.
 
 Usage:
     python examples/model_comparison.py
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 from src.autocall import Autocallable
 from src.local_vol import ConstantVol, TermStructureVol, build_local_vol_from_market
 from src.vol_surface import build_vol_surface_from_market
+from src.heston import HestonModel
 from src.market_data import load_sample_data
 
 N_PATHS = 100_000
@@ -31,9 +33,9 @@ SEED = 42
 
 
 def main():
-    print("=" * 72)
-    print("MODEL COMPARISON: CONSTANT VOL vs TERM STRUCTURE vs LOCAL VOL")
-    print("=" * 72)
+    print("=" * 78)
+    print("MODEL COMPARISON: CONSTANT VOL vs TERM STRUCTURE vs LOCAL VOL vs HESTON")
+    print("=" * 78)
 
     # ── 1. Load market data ──
     print("\n1. Loading market data...")
@@ -76,6 +78,19 @@ def main():
     lv.precompute_grid()
     print(f"   Model 3: {lv.model_name}")
 
+    # Model 4: Heston stochastic volatility
+    # Typical equity parameters: negative rho (leverage effect),
+    # v0 = ATM_vol^2, theta = long-term variance
+    heston = HestonModel(
+        kappa=2.0,
+        theta=atm_vol**2,
+        xi=0.3,
+        v0=atm_vol**2,
+        rho=-0.7,
+    )
+    print(f"   Model 4: {heston.model_name}")
+    print(f"            Feller condition: {'satisfied' if heston.feller_satisfied else 'VIOLATED'}")
+
     # ── 4. Define product ──
     print(f"\n4. Product: Phoenix Autocallable on SPY")
     product_params = dict(
@@ -102,6 +117,7 @@ def main():
         "Constant Vol": None,  # Uses sigma parameter directly
         "Term Structure": ts_vol,
         "Local Vol (Dupire)": lv,
+        "Heston (SV)": heston,
     }
 
     results = {}
@@ -129,39 +145,53 @@ def main():
     # ── 7. Key insights ──
     r_const = results["Constant Vol"]
     r_lv = results["Local Vol (Dupire)"]
+    r_heston = results["Heston (SV)"]
 
-    ki_diff = r_lv["ki_probability"] - r_const["ki_probability"]
-    price_diff = r_lv["price"] - r_const["price"]
+    ki_diff_lv = r_lv["ki_probability"] - r_const["ki_probability"]
+    ki_diff_h = r_heston["ki_probability"] - r_const["ki_probability"]
+    price_diff_lv = r_lv["price"] - r_const["price"]
+    price_diff_h = r_heston["price"] - r_const["price"]
 
     print(f"\n{'─' * 72}")
     print("7. KEY INSIGHTS (Model Risk)")
     print(f"{'─' * 72}")
     print(f"""
    Local Vol vs Constant Vol:
-   - KI probability:  {r_const['ki_probability']:.1%} → {r_lv['ki_probability']:.1%}  (Δ = {ki_diff:+.1%})
-   - Price difference: {price_diff:+.2f} (on notional 100)
-   - Autocall prob:   {r_const['total_autocall_prob']:.1%} → {r_lv['total_autocall_prob']:.1%}
+   - KI probability:  {r_const['ki_probability']:.1%} → {r_lv['ki_probability']:.1%}  (delta = {ki_diff_lv:+.1%})
+   - Price difference: {price_diff_lv:+.2f} (on notional 100)
+
+   Heston vs Constant Vol:
+   - KI probability:  {r_const['ki_probability']:.1%} → {r_heston['ki_probability']:.1%}  (delta = {ki_diff_h:+.1%})
+   - Price difference: {price_diff_h:+.2f} (on notional 100)
 
    WHY: Constant vol assumes volatility stays fixed regardless of spot moves.
-   In reality (captured by local vol), vol RISES when spot DROPS (leverage
-   effect / vol smile). For a knock-in autocallable:
+   Local vol captures the vol smile deterministically (vol = f(S, t)).
+   Heston adds stochastic volatility — vol itself is random and correlated
+   with spot (rho < 0). Both models capture the leverage effect:
      - Higher vol on the downside → higher probability of breaching the KI barrier
      - This means constant vol UNDERESTIMATES the knock-in risk
-     - This is a material model risk that traders must account for
+     - Heston also captures vol-of-vol (fat tails), which further impacts
+       barrier products
+
+   Local Vol vs Heston: Local vol is calibrated to match the full implied vol
+   smile by construction. Heston generates an approximate smile via its 5
+   parameters. The difference reveals model risk — the same market data
+   produces different exotic prices depending on the model choice.
 
    IMPLICATION: A desk using constant vol for hedging would be underhedged
    against downside scenarios — exactly when hedging matters most.
     """)
 
     # ── 8. Delta comparison ──
-    print(f"{'─' * 72}")
+    print(f"{'─' * 78}")
     print("8. DELTA PROFILE COMPARISON")
-    print(f"{'─' * 72}")
+    print(f"{'─' * 78}")
     from src import greeks as greeks_module
 
     spots = np.array([0.7, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1]) * spot
-    print(f"   {'S/S0':>6s}  {'Delta(Const)':>14s}  {'Delta(LocalVol)':>16s}  {'Diff':>8s}")
-    print(f"   {'─' * 50}")
+    print(f"   {'S/S0':>6s}  {'Delta(Const)':>14s}  {'Delta(LocalVol)':>16s}  "
+          f"{'Delta(Heston)':>14s}  {'LV-Const':>10s}  {'H-Const':>10s}")
+    print(f"   {'─' * 78}")
 
     for s in spots:
         ac_c = Autocallable(**product_params)
@@ -174,11 +204,17 @@ def main():
         d_lv = greeks_module.delta(ac_l, n_paths=50_000, seed=SEED)
         ac_l.S0 = spot
 
-        print(f"   {s/spot:>6.0%}  {d_const:>+14.4f}  {d_lv:>+16.4f}  {d_lv-d_const:>+8.4f}")
+        ac_h = Autocallable(**product_params, vol_model=heston)
+        ac_h.S0 = s
+        d_h = greeks_module.delta(ac_h, n_paths=50_000, seed=SEED)
+        ac_h.S0 = spot
 
-    print(f"\n{'=' * 72}")
+        print(f"   {s/spot:>6.0%}  {d_const:>+14.4f}  {d_lv:>+16.4f}  "
+              f"{d_h:>+14.4f}  {d_lv-d_const:>+10.4f}  {d_h-d_const:>+10.4f}")
+
+    print(f"\n{'=' * 78}")
     print("ANALYSIS COMPLETE")
-    print(f"{'=' * 72}")
+    print(f"{'=' * 78}")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
 """
 PnL Explanation (Attribution) for autocallable products.
 
-Decomposes daily P&L into Greek contributions using Taylor expansion:
-    ΔP&L ≈ Δ·δS + ½Γ·(δS)² + ν·δσ + Θ·δt + unexplained
+Decomposes daily P&L into Greek contributions using enhanced Taylor expansion:
+    ΔP&L ≈ Δ·δS + ½Γ·(δS)² + ν·δσ + Θ·δt + Vanna·δS·δσ + ½Volga·(δσ)² + unexplained
 
-Reference: Hull Ch. 19 (Greek Letters).
+Includes higher-order cross-Greeks (Vanna, Volga) for improved attribution
+of joint spot-vol moves.
+
+Reference: Hull Ch. 19 (Greek Letters); Taleb, "Dynamic Hedging", Ch. 8.
 """
 
 import numpy as np
@@ -46,8 +49,13 @@ def pnl_attribution(
         'gamma_pnl': ½ * Γ * (δS)²
         'vega_pnl': ν * δσ
         'theta_pnl': Θ * δt
-        'unexplained': residual
+        'vanna_pnl': Vanna * δS * δσ
+        'volga_pnl': ½ * Volga * (δσ)²
+        'explained': sum of all Greek terms
+        'unexplained': actual_pnl - explained
         'explained_pct': percentage of P&L explained by Greeks
+        'explained_pct_breakdown': dict of each term's % contribution
+        'greeks': dict of all Greek values
     """
     g = greeks_module.compute_all_greeks(product, n_paths=n_paths, seed=seed)
 
@@ -63,15 +71,34 @@ def pnl_attribution(
 
     actual_pnl = V_after - V_before
 
+    # First-order terms
     delta_pnl = g["delta"] * dS
-    gamma_pnl = 0.5 * g["gamma"] * dS**2
     vega_pnl = g["vega"] * d_sigma
     theta_pnl = g["theta"] * dt_days
 
-    explained = delta_pnl + gamma_pnl + vega_pnl + theta_pnl
+    # Second-order terms
+    gamma_pnl = 0.5 * g["gamma"] * dS**2
+    vanna_pnl = g["vanna"] * dS * d_sigma
+    volga_pnl = 0.5 * g["volga"] * d_sigma**2
+
+    explained = delta_pnl + gamma_pnl + vega_pnl + theta_pnl + vanna_pnl + volga_pnl
     unexplained = actual_pnl - explained
 
     explained_pct = (explained / actual_pnl * 100) if abs(actual_pnl) > 1e-10 else 0.0
+
+    # Percentage breakdown of each term relative to actual P&L
+    def _term_pct(term: float) -> float:
+        return (term / actual_pnl * 100) if abs(actual_pnl) > 1e-10 else 0.0
+
+    explained_pct_breakdown = {
+        "delta_pct": _term_pct(delta_pnl),
+        "gamma_pct": _term_pct(gamma_pnl),
+        "vega_pct": _term_pct(vega_pnl),
+        "theta_pct": _term_pct(theta_pnl),
+        "vanna_pct": _term_pct(vanna_pnl),
+        "volga_pct": _term_pct(volga_pnl),
+        "unexplained_pct": _term_pct(unexplained),
+    }
 
     return {
         "actual_pnl": actual_pnl,
@@ -79,9 +106,12 @@ def pnl_attribution(
         "gamma_pnl": gamma_pnl,
         "vega_pnl": vega_pnl,
         "theta_pnl": theta_pnl,
+        "vanna_pnl": vanna_pnl,
+        "volga_pnl": volga_pnl,
         "explained": explained,
         "unexplained": unexplained,
         "explained_pct": explained_pct,
+        "explained_pct_breakdown": explained_pct_breakdown,
         "greeks": g,
     }
 
