@@ -1,13 +1,13 @@
 """
-Model Comparison: Constant Vol vs Term Structure vs Local Vol vs Heston
+Model Comparison: Constant Vol vs Term Structure vs Local Vol vs Heston vs SABR
 
-Prices the same Phoenix Autocallable under four volatility models to
+Prices the same Phoenix Autocallable under five volatility models to
 quantify model risk for barrier products.
 
 Key insight: constant vol underestimates knock-in probability because it
 ignores the vol smile (in reality, vol rises as spot drops — the "leverage
-effect"). Local vol and Heston capture this through different mechanisms,
-giving a more realistic risk picture.
+effect"). Local vol, Heston, and SABR capture this through different
+mechanisms, giving a more realistic risk picture.
 
 Usage:
     python examples/model_comparison.py
@@ -26,6 +26,8 @@ from src.autocall import Autocallable
 from src.local_vol import ConstantVol, TermStructureVol, build_local_vol_from_market
 from src.vol_surface import build_vol_surface_from_market
 from src.heston import HestonModel
+from src.sabr import SABRModel
+from src.vol_surface import extract_implied_vols
 from src.market_data import load_sample_data
 
 N_PATHS = 100_000
@@ -34,7 +36,7 @@ SEED = 42
 
 def main():
     print("=" * 78)
-    print("MODEL COMPARISON: CONSTANT VOL vs TERM STRUCTURE vs LOCAL VOL vs HESTON")
+    print("MODEL COMPARISON: CONSTANT VOL vs TERM STRUCTURE vs LOCAL VOL vs HESTON vs SABR")
     print("=" * 78)
 
     # ── 1. Load market data ──
@@ -91,6 +93,28 @@ def main():
     print(f"   Model 4: {heston.model_name}")
     print(f"            Feller condition: {'satisfied' if heston.feller_satisfied else 'VIOLATED'}")
 
+    # Model 5: SABR (Hagan approximation, ATM vol as constant input)
+    print("\n   Calibrating SABR per maturity slice...")
+    options_df = data["options_chain"]
+    vol_data = extract_implied_vols(options_df, spot, r)
+    sabr_calibrations = SABRModel.calibrate_surface(vol_data, spot=spot, r=r)
+    print(f"   SABR: calibrated {len(sabr_calibrations)} maturity slices")
+
+    # Get SABR ATM vol at product maturity by interpolating from nearest slices
+    sabr_Ts = sorted(sabr_calibrations.keys())
+    if sabr_Ts:
+        # Find closest calibrated maturity to T_product
+        closest_T = min(sabr_Ts, key=lambda t: abs(t - T_product))
+        sabr_model = sabr_calibrations[closest_T]["model"]
+        F_product = spot * np.exp(r * T_product)
+        sabr_atm_vol = sabr_model.implied_vol(F_product, F_product, T_product)
+        print(f"   Model 5: SABR ATM vol at T={T_product:.2f}y: {sabr_atm_vol:.2%} "
+              f"(from slice T={closest_T:.3f}y)")
+        print(f"            {sabr_model.model_name}")
+    else:
+        sabr_atm_vol = atm_vol  # fallback to SVI ATM vol
+        print(f"   Model 5: SABR calibration failed, using SVI ATM vol = {sabr_atm_vol:.2%}")
+
     # ── 4. Define product ──
     print(f"\n4. Product: Phoenix Autocallable on SPY")
     product_params = dict(
@@ -118,11 +142,19 @@ def main():
         "Term Structure": ts_vol,
         "Local Vol (Dupire)": lv,
         "Heston (SV)": heston,
+        "SABR (ATM const)": None,  # Uses SABR ATM vol as constant (Approach A)
     }
+    # Override sigma for SABR model (uses SABR-calibrated ATM vol)
+    sabr_product_params = dict(product_params)
+    sabr_product_params["sigma"] = sabr_atm_vol
 
     results = {}
     for name, vol_model in models.items():
-        ac = Autocallable(**product_params, vol_model=vol_model)
+        if name == "SABR (ATM const)":
+            # SABR uses its own ATM vol as constant sigma
+            ac = Autocallable(**sabr_product_params, vol_model=None)
+        else:
+            ac = Autocallable(**product_params, vol_model=vol_model)
         result = ac.price(n_paths=N_PATHS, n_steps_per_period=25, seed=SEED)
         results[name] = result
         print(f"   {name:25s}: price={result['price']:.2f}  "
@@ -146,11 +178,14 @@ def main():
     r_const = results["Constant Vol"]
     r_lv = results["Local Vol (Dupire)"]
     r_heston = results["Heston (SV)"]
+    r_sabr = results["SABR (ATM const)"]
 
     ki_diff_lv = r_lv["ki_probability"] - r_const["ki_probability"]
     ki_diff_h = r_heston["ki_probability"] - r_const["ki_probability"]
+    ki_diff_sabr = r_sabr["ki_probability"] - r_const["ki_probability"]
     price_diff_lv = r_lv["price"] - r_const["price"]
     price_diff_h = r_heston["price"] - r_const["price"]
+    price_diff_sabr = r_sabr["price"] - r_const["price"]
 
     print(f"\n{'─' * 72}")
     print("7. KEY INSIGHTS (Model Risk)")
@@ -164,6 +199,11 @@ def main():
    - KI probability:  {r_const['ki_probability']:.1%} → {r_heston['ki_probability']:.1%}  (delta = {ki_diff_h:+.1%})
    - Price difference: {price_diff_h:+.2f} (on notional 100)
 
+   SABR (ATM const) vs Constant Vol:
+   - KI probability:  {r_const['ki_probability']:.1%} → {r_sabr['ki_probability']:.1%}  (delta = {ki_diff_sabr:+.1%})
+   - Price difference: {price_diff_sabr:+.2f} (on notional 100)
+   - ATM vol: SVI={atm_vol:.2%} vs SABR={sabr_atm_vol:.2%} (delta = {sabr_atm_vol - atm_vol:+.4f})
+
    WHY: Constant vol assumes volatility stays fixed regardless of spot moves.
    Local vol captures the vol smile deterministically (vol = f(S, t)).
    Heston adds stochastic volatility — vol itself is random and correlated
@@ -173,6 +213,13 @@ def main():
      - Heston also captures vol-of-vol (fat tails), which further impacts
        barrier products
 
+   SABR: The SABR model (Hagan 2002) provides a 3-parameter (alpha, rho, nu)
+   implied vol approximation. Here we use Approach A: calibrate SABR to market
+   data, extract the ATM vol, and use it as a constant vol input. The SABR ATM
+   vol may differ from the SVI ATM vol because the two models fit the smile
+   differently — SVI uses 5 params on total variance, SABR uses 3 params on
+   implied vol directly. The price difference reveals this calibration risk.
+
    Local Vol vs Heston: Local vol is calibrated to match the full implied vol
    smile by construction. Heston generates an approximate smile via its 5
    parameters. The difference reveals model risk — the same market data
@@ -181,6 +228,33 @@ def main():
    IMPLICATION: A desk using constant vol for hedging would be underhedged
    against downside scenarios — exactly when hedging matters most.
     """)
+
+    # ── 7b. SABR vs SVI per-slice RMSE comparison ──
+    print(f"{'─' * 72}")
+    print("7b. SABR vs SVI PER-SLICE RMSE COMPARISON")
+    print(f"{'─' * 72}")
+    from src.vol_surface import calibrate_surface as svi_calibrate_surface
+    svi_calibrations = svi_calibrate_surface(vol_data)
+
+    print(f"   {'T':>8s}  {'SABR RMSE':>12s}  {'SVI RMSE':>12s}  {'Winner':>8s}  {'Note':>20s}")
+    print(f"   {'─' * 66}")
+
+    common_Ts = sorted(set(sabr_calibrations.keys()) & set(svi_calibrations.keys()))
+    for T_val in common_Ts:
+        sabr_rmse = sabr_calibrations[T_val]["rmse"]
+        svi_rmse = svi_calibrations[T_val]["rmse"]
+        winner = "SABR" if sabr_rmse < svi_rmse else "SVI"
+        note = "short-T" if T_val < 0.25 else ("medium-T" if T_val < 0.75 else "long-T")
+        print(f"   {T_val:>8.3f}  {sabr_rmse:>12.6f}  {svi_rmse:>12.6f}  {winner:>8s}  {note:>20s}")
+
+    if common_Ts:
+        sabr_rmses = [sabr_calibrations[T]["rmse"] for T in common_Ts]
+        svi_rmses = [svi_calibrations[T]["rmse"] for T in common_Ts]
+        print(f"\n   Average SABR RMSE: {np.mean(sabr_rmses):.6f}")
+        print(f"   Average SVI RMSE:  {np.mean(svi_rmses):.6f}")
+        print(f"\n   NOTE: Hagan's SABR approximation is first-order in T, so it tends")
+        print(f"   to perform better for short maturities. SVI (5 params) has more")
+        print(f"   flexibility to fit the total variance smile across all maturities.")
 
     # ── 8. Delta comparison ──
     print(f"{'─' * 78}")
